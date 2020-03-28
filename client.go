@@ -18,6 +18,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -58,7 +59,7 @@ type Client interface {
 	// IsConnected returns a bool signifying whether
 	// the client is connected or not.
 	IsConnected() bool
-	// IsConnectionOpen return a bool signifying wether the client has an active
+	// IsConnectionOpen return a bool signifying whether the client has an active
 	// connection to mqtt broker, i.e not in disconnected or reconnect mode
 	IsConnectionOpen() bool
 	// Connect will create a connection to the message broker, by default
@@ -112,6 +113,7 @@ type client struct {
 	stop            chan struct{}
 	persist         Store
 	options         ClientOptions
+	optionsMu       sync.Mutex // Protects the options in a few limited cases where needed for testing
 	workers         sync.WaitGroup
 }
 
@@ -140,9 +142,6 @@ func NewClient(o *ClientOptions) Client {
 	c.messageIds = messageIds{index: make(map[uint16]tokenCompletor)}
 	c.msgRouter, c.stopRouter = newRouter()
 	c.msgRouter.setDefaultHandler(c.options.DefaultPublishHandler)
-	if !c.options.AutoReconnect {
-		c.options.MessageChannelDepth = 0
-	}
 	return c
 }
 
@@ -157,6 +156,8 @@ func (c *client) AddRoute(topic string, callback MessageHandler) {
 
 // IsConnected returns a bool signifying whether
 // the client is connected or not.
+// connected means that the connection is up now OR it will
+// be established/reestablished automatically when possible
 func (c *client) IsConnected() bool {
 	c.RLock()
 	defer c.RUnlock()
@@ -165,6 +166,8 @@ func (c *client) IsConnected() bool {
 	case status == connected:
 		return true
 	case c.options.AutoReconnect && status > connecting:
+		return true
+	case c.options.ConnectRetry && status == connecting:
 		return true
 	default:
 		return false
@@ -210,14 +213,27 @@ func (c *client) Connect() Token {
 	t := newToken(packets.Connect).(*ConnectToken)
 	DEBUG.Println(CLI, "Connect()")
 
-	c.obound = make(chan *PacketAndToken, c.options.MessageChannelDepth)
-	c.oboundP = make(chan *PacketAndToken, c.options.MessageChannelDepth)
+	if c.options.ConnectRetry && atomic.LoadUint32(&c.status) != disconnected {
+		// if in any state other than disconnected and ConnectRetry is
+		// enabled then the connection will come up automatically
+		// client can assume connection is up
+		WARN.Println(CLI, "Connect() called but not disconnected")
+		t.returnCode = packets.Accepted
+		t.flowComplete()
+		return t
+	}
+
+	c.obound = make(chan *PacketAndToken)
+	c.oboundP = make(chan *PacketAndToken)
 	c.ibound = make(chan packets.ControlPacket)
 
-	go func() {
-		c.persist.Open()
+	c.persist.Open()
+	if c.options.ConnectRetry {
+		c.reserveStoredPublishIDs() // Reserve IDs to allow publish before connect complete
+	}
+	c.setConnected(connecting)
 
-		c.setConnected(connecting)
+	go func() {
 		c.errors = make(chan error, 1)
 		c.stop = make(chan struct{})
 
@@ -229,12 +245,20 @@ func (c *client) Connect() Token {
 			return
 		}
 
-		for _, broker := range c.options.Servers {
+	RETRYCONN:
+		c.optionsMu.Lock() // Protect c.options.Servers so that servers can be added in test cases
+		brokers := c.options.Servers
+		c.optionsMu.Unlock()
+
+		for _, broker := range brokers {
 			cm := newConnectMsgFromOptions(&c.options, broker)
 			c.options.ProtocolVersion = protocolVersion
 		CONN:
 			DEBUG.Println(CLI, "about to write new connect msg")
-			c.conn, err = openConnection(broker, c.options.TLSConfig, c.options.ConnectTimeout, c.options.HTTPHeaders)
+			c.Lock()
+			c.conn, err = openConnection(broker, c.options.TLSConfig, c.options.ConnectTimeout,
+				c.options.HTTPHeaders)
+			c.Unlock()
 			if err == nil {
 				DEBUG.Println(CLI, "socket connected to broker")
 				switch c.options.ProtocolVersion {
@@ -260,10 +284,12 @@ func (c *client) Connect() Token {
 
 				rc, t.sessionPresent = c.connect()
 				if rc != packets.Accepted {
+					c.Lock()
 					if c.conn != nil {
 						c.conn.Close()
 						c.conn = nil
 					}
+					c.Unlock()
 					//if the protocol version was explicitly set don't do any fallback
 					if c.options.protocolVersionExplicit {
 						ERROR.Println(CLI, "Connecting to", broker, "CONNACK was not CONN_ACCEPTED, but rather", packets.ConnackReturnCodes[rc])
@@ -284,6 +310,14 @@ func (c *client) Connect() Token {
 		}
 
 		if c.conn == nil {
+			if c.options.ConnectRetry {
+				DEBUG.Println(CLI, "Connect failed, sleeping for", int(c.options.ConnectRetryInterval.Seconds()), "seconds and will then retry")
+				time.Sleep(c.options.ConnectRetryInterval)
+
+				if atomic.LoadUint32(&c.status) == connecting {
+					goto RETRYCONN
+				}
+			}
 			ERROR.Println(CLI, "Failed to connect to a broker")
 			c.setConnected(disconnected)
 			c.persist.Close()
@@ -306,7 +340,7 @@ func (c *client) Connect() Token {
 			go keepalive(c)
 		}
 
-		c.incomingPubChan = make(chan *packets.PublishPacket, c.options.MessageChannelDepth)
+		c.incomingPubChan = make(chan *packets.PublishPacket)
 		c.msgRouter.matchAndDispatch(c.incomingPubChan, c.options.Order, c)
 
 		c.setConnected(connected)
@@ -322,7 +356,8 @@ func (c *client) Connect() Token {
 		go incoming(c)
 
 		// Take care of any messages in the store
-		if c.options.CleanSession == false {
+		if !c.options.CleanSession {
+			c.workers.Add(1) // disconnect during resume can lead to reconnect being called before resume completes
 			c.resume(c.options.ResumeSubs)
 		} else {
 			c.persist.Reset()
@@ -345,7 +380,13 @@ func (c *client) reconnect() {
 	)
 
 	for rc != 0 && atomic.LoadUint32(&c.status) != disconnected {
-		for _, broker := range c.options.Servers {
+		if nil != c.options.OnReconnecting {
+			c.options.OnReconnecting(c, &c.options)
+		}
+		c.optionsMu.Lock() // Protect c.options.Servers so that servers can be added in test cases
+		brokers := c.options.Servers
+		c.optionsMu.Unlock()
+		for _, broker := range brokers {
 			cm := newConnectMsgFromOptions(&c.options, broker)
 			DEBUG.Println(CLI, "about to write new connect msg")
 			c.Lock()
@@ -375,8 +416,10 @@ func (c *client) reconnect() {
 
 				rc, _ = c.connect()
 				if rc != packets.Accepted {
-					c.conn.Close()
-					c.conn = nil
+					if c.conn != nil {
+						c.conn.Close()
+						c.conn = nil
+					}
 					//if the protocol version was explicitly set don't do any fallback
 					if c.options.protocolVersionExplicit {
 						ERROR.Println(CLI, "Connecting to", broker, "CONNACK was not Accepted, but rather", packets.ConnackReturnCodes[rc])
@@ -430,7 +473,8 @@ func (c *client) reconnect() {
 	go outgoing(c)
 	go incoming(c)
 
-	c.resume(false)
+	c.workers.Add(1) // disconnect during resume can lead to reconnect being called before resume completes
+	c.resume(c.options.ResumeSubs)
 }
 
 // This function is only used for receiving a connack
@@ -580,11 +624,13 @@ func (c *client) Publish(topic string, qos byte, retained bool, payload interfac
 	pub.Qos = qos
 	pub.TopicName = topic
 	pub.Retain = retained
-	switch payload.(type) {
+	switch p := payload.(type) {
 	case string:
-		pub.Payload = []byte(payload.(string))
+		pub.Payload = []byte(p)
 	case []byte:
-		pub.Payload = payload.([]byte)
+		pub.Payload = p
+	case bytes.Buffer:
+		pub.Payload = p.Bytes()
 	default:
 		token.setError(fmt.Errorf("Unknown payload type"))
 		return token
@@ -595,11 +641,22 @@ func (c *client) Publish(topic string, qos byte, retained bool, payload interfac
 		token.messageID = pub.MessageID
 	}
 	persistOutbound(c.persist, pub)
-	if c.connectionStatus() == reconnecting {
+	switch c.connectionStatus() {
+	case connecting:
+		DEBUG.Println(CLI, "storing publish message (connecting), topic:", topic)
+	case reconnecting:
 		DEBUG.Println(CLI, "storing publish message (reconnecting), topic:", topic)
-	} else {
+	default:
 		DEBUG.Println(CLI, "sending publish message, topic:", topic)
-		c.obound <- &PacketAndToken{p: pub, t: token}
+		publishWaitTimeout := c.options.WriteTimeout
+		if publishWaitTimeout == 0 {
+			publishWaitTimeout = time.Second * 30
+		}
+		select {
+		case c.obound <- &PacketAndToken{p: pub, t: token}:
+		case <-time.After(publishWaitTimeout):
+			token.setError(errors.New("publish was broken by timeout"))
+		}
 	}
 	return token
 }
@@ -613,6 +670,18 @@ func (c *client) Subscribe(topic string, qos byte, callback MessageHandler) Toke
 		token.setError(ErrNotConnected)
 		return token
 	}
+	if !c.IsConnectionOpen() {
+		switch {
+		case !c.options.ResumeSubs:
+			// if not connected and resumesubs not set this sub will be thrown away
+			token.setError(fmt.Errorf("not currently connected and ResumeSubs not set"))
+			return token
+		case c.options.CleanSession && c.connectionStatus() == reconnecting:
+			// if reconnecting and cleansession is true this sub will be thrown away
+			token.setError(fmt.Errorf("reconnecting state and cleansession is true"))
+			return token
+		}
+	}
 	sub := packets.NewControlPacket(packets.Subscribe).(*packets.SubscribePacket)
 	if err := validateTopicAndQos(topic, qos); err != nil {
 		token.setError(err)
@@ -620,10 +689,13 @@ func (c *client) Subscribe(topic string, qos byte, callback MessageHandler) Toke
 	}
 	sub.Topics = append(sub.Topics, topic)
 	sub.Qoss = append(sub.Qoss, qos)
-	DEBUG.Println(CLI, sub.String())
 
-	if strings.HasPrefix(topic, "$share") {
+	if strings.HasPrefix(topic, "$share/") {
 		topic = strings.Join(strings.Split(topic, "/")[2:], "/")
+	}
+
+	if strings.HasPrefix(topic, "$queue/") {
+		topic = strings.TrimPrefix(topic, "$queue/")
 	}
 
 	if callback != nil {
@@ -631,7 +703,31 @@ func (c *client) Subscribe(topic string, qos byte, callback MessageHandler) Toke
 	}
 
 	token.subs = append(token.subs, topic)
-	c.oboundP <- &PacketAndToken{p: sub, t: token}
+
+	if sub.MessageID == 0 {
+		sub.MessageID = c.getID(token)
+		token.messageID = sub.MessageID
+	}
+	DEBUG.Println(CLI, sub.String())
+
+	persistOutbound(c.persist, sub)
+	switch c.connectionStatus() {
+	case connecting:
+		DEBUG.Println(CLI, "storing subscribe message (connecting), topic:", topic)
+	case reconnecting:
+		DEBUG.Println(CLI, "storing subscribe message (reconnecting), topic:", topic)
+	default:
+		DEBUG.Println(CLI, "sending subscribe message, topic:", topic)
+		subscribeWaitTimeout := c.options.WriteTimeout
+		if subscribeWaitTimeout == 0 {
+			subscribeWaitTimeout = time.Second * 30
+		}
+		select {
+		case c.oboundP <- &PacketAndToken{p: sub, t: token}:
+		case <-time.After(subscribeWaitTimeout):
+			token.setError(errors.New("subscribe was broken by timeout"))
+		}
+	}
 	DEBUG.Println(CLI, "exit Subscribe")
 	return token
 }
@@ -646,6 +742,18 @@ func (c *client) SubscribeMultiple(filters map[string]byte, callback MessageHand
 		token.setError(ErrNotConnected)
 		return token
 	}
+	if !c.IsConnectionOpen() {
+		switch {
+		case !c.options.ResumeSubs:
+			// if not connected and resumesubs not set this sub will be thrown away
+			token.setError(fmt.Errorf("not currently connected and ResumeSubs not set"))
+			return token
+		case c.options.CleanSession && c.connectionStatus() == reconnecting:
+			// if reconnecting and cleansession is true this sub will be thrown away
+			token.setError(fmt.Errorf("reconnecting state and cleansession is true"))
+			return token
+		}
+	}
 	sub := packets.NewControlPacket(packets.Subscribe).(*packets.SubscribePacket)
 	if sub.Topics, sub.Qoss, err = validateSubscribeMap(filters); err != nil {
 		token.setError(err)
@@ -659,14 +767,59 @@ func (c *client) SubscribeMultiple(filters map[string]byte, callback MessageHand
 	}
 	token.subs = make([]string, len(sub.Topics))
 	copy(token.subs, sub.Topics)
-	c.oboundP <- &PacketAndToken{p: sub, t: token}
+
+	if sub.MessageID == 0 {
+		sub.MessageID = c.getID(token)
+		token.messageID = sub.MessageID
+	}
+	persistOutbound(c.persist, sub)
+	switch c.connectionStatus() {
+	case connecting:
+		DEBUG.Println(CLI, "storing subscribe message (connecting), topics:", sub.Topics)
+	case reconnecting:
+		DEBUG.Println(CLI, "storing subscribe message (reconnecting), topics:", sub.Topics)
+	default:
+		DEBUG.Println(CLI, "sending subscribe message, topics:", sub.Topics)
+		subscribeWaitTimeout := c.options.WriteTimeout
+		if subscribeWaitTimeout == 0 {
+			subscribeWaitTimeout = time.Second * 30
+		}
+		select {
+		case c.oboundP <- &PacketAndToken{p: sub, t: token}:
+		case <-time.After(subscribeWaitTimeout):
+			token.setError(errors.New("subscribe was broken by timeout"))
+		}
+	}
 	DEBUG.Println(CLI, "exit SubscribeMultiple")
 	return token
+}
+
+// reserveStoredPublishIDs reserves the ids for publish packets in the persistent store to ensure these are not duplicated
+func (c *client) reserveStoredPublishIDs() {
+	// The resume function sets the stored id for publish packets only (some other packets
+	// will get new ids in net code). This means that the only keys we need to ensure are
+	// unique are the publish ones (and these will completed/replaced in resume() )
+	if !c.options.CleanSession {
+		storedKeys := c.persist.All()
+		for _, key := range storedKeys {
+			packet := c.persist.Get(key)
+			if packet == nil {
+				continue
+			}
+			switch packet.(type) {
+			case *packets.PublishPacket:
+				details := packet.Details()
+				token := &PlaceHolderToken{id: details.MessageID}
+				c.claimID(token, details.MessageID)
+			}
+		}
+	}
 }
 
 // Load all stored messages and resend them
 // Call this to ensure QOS > 1,2 even after an application crash
 func (c *client) resume(subscription bool) {
+	defer c.workers.Done() // resume must complete before any attempt to reconnect is made
 
 	storedKeys := c.persist.All()
 	for _, key := range storedKeys {
@@ -680,20 +833,33 @@ func (c *client) resume(subscription bool) {
 			case *packets.SubscribePacket:
 				if subscription {
 					DEBUG.Println(STR, fmt.Sprintf("loaded pending subscribe (%d)", details.MessageID))
+					subPacket := packet.(*packets.SubscribePacket)
 					token := newToken(packets.Subscribe).(*SubscribeToken)
-					c.oboundP <- &PacketAndToken{p: packet, t: token}
+					token.messageID = details.MessageID
+					token.subs = append(token.subs, subPacket.Topics...)
+					c.claimID(token, details.MessageID)
+					select {
+					case c.oboundP <- &PacketAndToken{p: packet, t: token}:
+					case <-c.stop:
+						return
+					}
 				}
 			case *packets.UnsubscribePacket:
 				if subscription {
 					DEBUG.Println(STR, fmt.Sprintf("loaded pending unsubscribe (%d)", details.MessageID))
 					token := newToken(packets.Unsubscribe).(*UnsubscribeToken)
-					c.oboundP <- &PacketAndToken{p: packet, t: token}
+					select {
+					case c.oboundP <- &PacketAndToken{p: packet, t: token}:
+					case <-c.stop:
+						return
+					}
 				}
 			case *packets.PubrelPacket:
 				DEBUG.Println(STR, fmt.Sprintf("loaded pending pubrel (%d)", details.MessageID))
 				select {
 				case c.oboundP <- &PacketAndToken{p: packet, t: nil}:
 				case <-c.stop:
+					return
 				}
 			case *packets.PublishPacket:
 				token := newToken(packets.Publish).(*PublishToken)
@@ -701,18 +867,23 @@ func (c *client) resume(subscription bool) {
 				c.claimID(token, details.MessageID)
 				DEBUG.Println(STR, fmt.Sprintf("loaded pending publish (%d)", details.MessageID))
 				DEBUG.Println(STR, details)
-				c.obound <- &PacketAndToken{p: packet, t: token}
+				select {
+				case c.obound <- &PacketAndToken{p: packet, t: token}:
+				case <-c.stop:
+					return
+				}
 			default:
 				ERROR.Println(STR, "invalid message type in store (discarded)")
 				c.persist.Del(key)
 			}
 		} else {
 			switch packet.(type) {
-			case *packets.PubrelPacket, *packets.PublishPacket:
+			case *packets.PubrelPacket:
 				DEBUG.Println(STR, fmt.Sprintf("loaded pending incomming (%d)", details.MessageID))
 				select {
 				case c.ibound <- packet:
 				case <-c.stop:
+					return
 				}
 			default:
 				ERROR.Println(STR, "invalid message type in store (discarded)")
@@ -732,13 +903,48 @@ func (c *client) Unsubscribe(topics ...string) Token {
 		token.setError(ErrNotConnected)
 		return token
 	}
+	if !c.IsConnectionOpen() {
+		switch {
+		case !c.options.ResumeSubs:
+			// if not connected and resumesubs not set this unsub will be thrown away
+			token.setError(fmt.Errorf("not currently connected and ResumeSubs not set"))
+			return token
+		case c.options.CleanSession && c.connectionStatus() == reconnecting:
+			// if reconnecting and cleansession is true this unsub will be thrown away
+			token.setError(fmt.Errorf("reconnecting state and cleansession is true"))
+			return token
+		}
+	}
 	unsub := packets.NewControlPacket(packets.Unsubscribe).(*packets.UnsubscribePacket)
 	unsub.Topics = make([]string, len(topics))
 	copy(unsub.Topics, topics)
 
-	c.oboundP <- &PacketAndToken{p: unsub, t: token}
-	for _, topic := range topics {
-		c.msgRouter.deleteRoute(topic)
+	if unsub.MessageID == 0 {
+		unsub.MessageID = c.getID(token)
+		token.messageID = unsub.MessageID
+	}
+
+	persistOutbound(c.persist, unsub)
+
+	switch c.connectionStatus() {
+	case connecting:
+		DEBUG.Println(CLI, "storing unsubscribe message (connecting), topics:", topics)
+	case reconnecting:
+		DEBUG.Println(CLI, "storing unsubscribe message (reconnecting), topics:", topics)
+	default:
+		DEBUG.Println(CLI, "sending unsubscribe message, topics:", topics)
+		subscribeWaitTimeout := c.options.WriteTimeout
+		if subscribeWaitTimeout == 0 {
+			subscribeWaitTimeout = time.Second * 30
+		}
+		select {
+		case c.oboundP <- &PacketAndToken{p: unsub, t: token}:
+			for _, topic := range topics {
+				c.msgRouter.deleteRoute(topic)
+			}
+		case <-time.After(subscribeWaitTimeout):
+			token.setError(errors.New("unsubscribe was broken by timeout"))
+		}
 	}
 
 	DEBUG.Println(CLI, "exit Unsubscribe")

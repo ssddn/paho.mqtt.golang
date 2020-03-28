@@ -10,6 +10,7 @@
  *    Seth Hoenig
  *    Allan Stockdill-Mander
  *    Mike Robertson
+ *    Måns Ansgariusson
  */
 
 // Portions copyright © 2018 TIBCO Software Inc.
@@ -20,6 +21,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -44,6 +46,10 @@ type ConnectionLostHandler func(Client, error)
 // at initial connection and on reconnection
 type OnConnectHandler func(Client)
 
+// ReconnectHandler is invoked prior to reconnecting after
+// the initial connection is lost
+type ReconnectHandler func(Client, *ClientOptions)
+
 // ClientOptions contains configurable options for an Client.
 type ClientOptions struct {
 	Servers                 []*url.URL
@@ -66,10 +72,13 @@ type ClientOptions struct {
 	ConnectTimeout          time.Duration
 	MaxReconnectInterval    time.Duration
 	AutoReconnect           bool
+	ConnectRetryInterval    time.Duration
+	ConnectRetry            bool
 	Store                   Store
 	DefaultPublishHandler   MessageHandler
 	OnConnect               OnConnectHandler
 	OnConnectionLost        ConnectionLostHandler
+	OnReconnecting          ReconnectHandler
 	WriteTimeout            time.Duration
 	MessageChannelDepth     uint
 	ResumeSubs              bool
@@ -105,11 +114,12 @@ func NewClientOptions() *ClientOptions {
 		ConnectTimeout:          30 * time.Second,
 		MaxReconnectInterval:    10 * time.Minute,
 		AutoReconnect:           true,
+		ConnectRetryInterval:    30 * time.Second,
+		ConnectRetry:            false,
 		Store:                   nil,
 		OnConnect:               nil,
 		OnConnectionLost:        DefaultConnectionLostHandler,
 		WriteTimeout:            0, // 0 represents timeout disabled
-		MessageChannelDepth:     100,
 		ResumeSubs:              false,
 		HTTPHeaders:             make(map[string][]string),
 	}
@@ -125,12 +135,14 @@ func NewClientOptions() *ClientOptions {
 //
 // An example broker URI would look like: tcp://foobar.com:1883
 func (o *ClientOptions) AddBroker(server string) *ClientOptions {
+	re := regexp.MustCompile(`%(25)?`)
 	if len(server) > 0 && server[0] == ':' {
 		server = "127.0.0.1" + server
 	}
 	if !strings.Contains(server, "://") {
 		server = "tcp://" + server
 	}
+	server = re.ReplaceAllLiteralString(server, "%25")
 	brokerURI, err := url.Parse(server)
 	if err != nil {
 		ERROR.Println(CLI, "Failed to parse %q broker address: %s", server, err)
@@ -149,7 +161,7 @@ func (o *ClientOptions) SetResumeSubs(resume bool) *ClientOptions {
 
 // SetClientID will set the client id to be used by this client when
 // connecting to the MQTT broker. According to the MQTT v3.1 specification,
-// a client id mus be no longer than 23 characters.
+// a client id must be no longer than 23 characters.
 func (o *ClientOptions) SetClientID(id string) *ClientOptions {
 	o.ClientID = id
 	return o
@@ -157,7 +169,7 @@ func (o *ClientOptions) SetClientID(id string) *ClientOptions {
 
 // SetUsername will set the username to be used by this client when connecting
 // to the MQTT broker. Note: without the use of SSL/TLS, this information will
-// be sent in plaintext accross the wire.
+// be sent in plaintext across the wire.
 func (o *ClientOptions) SetUsername(u string) *ClientOptions {
 	o.Username = u
 	return o
@@ -165,7 +177,7 @@ func (o *ClientOptions) SetUsername(u string) *ClientOptions {
 
 // SetPassword will set the password to be used by this client when connecting
 // to the MQTT broker. Note: without the use of SSL/TLS, this information will
-// be sent in plaintext accross the wire.
+// be sent in plaintext across the wire.
 func (o *ClientOptions) SetPassword(p string) *ClientOptions {
 	o.Password = p
 	return o
@@ -174,7 +186,7 @@ func (o *ClientOptions) SetPassword(p string) *ClientOptions {
 // SetCredentialsProvider will set a method to be called by this client when
 // connecting to the MQTT broker that provide the current username and password.
 // Note: without the use of SSL/TLS, this information will be sent
-// in plaintext accross the wire.
+// in plaintext across the wire.
 func (o *ClientOptions) SetCredentialsProvider(p CredentialsProvider) *ClientOptions {
 	o.CredentialsProvider = p
 	return o
@@ -293,6 +305,13 @@ func (o *ClientOptions) SetConnectionLostHandler(onLost ConnectionLostHandler) *
 	return o
 }
 
+// SetReconnectingHandler sets the OnReconnecting callback to be executed prior
+// to the client attempting a reconnect to the MQTT broker.
+func (o *ClientOptions) SetReconnectingHandler(cb ReconnectHandler) *ClientOptions {
+	o.OnReconnecting = cb
+	return o
+}
+
 // SetWriteTimeout puts a limit on how long a mqtt publish should block until it unblocks with a
 // timeout error. A duration of 0 never times out. Default 30 seconds
 func (o *ClientOptions) SetWriteTimeout(t time.Duration) *ClientOptions {
@@ -301,7 +320,7 @@ func (o *ClientOptions) SetWriteTimeout(t time.Duration) *ClientOptions {
 }
 
 // SetConnectTimeout limits how long the client will wait when trying to open a connection
-// to an MQTT server before timeing out and erroring the attempt. A duration of 0 never times out.
+// to an MQTT server before timing out and erroring the attempt. A duration of 0 never times out.
 // Default 30 seconds. Currently only operational on TCP/TLS connections.
 func (o *ClientOptions) SetConnectTimeout(t time.Duration) *ClientOptions {
 	o.ConnectTimeout = t
@@ -323,10 +342,25 @@ func (o *ClientOptions) SetAutoReconnect(a bool) *ClientOptions {
 	return o
 }
 
-// SetMessageChannelDepth sets the size of the internal queue that holds messages while the
-// client is temporairily offline, allowing the application to publish when the client is
-// reconnecting. This setting is only valid if AutoReconnect is set to true, it is otherwise
-// ignored.
+// SetConnectRetryInterval sets the time that will be waited between connection attempts
+// when initially connecting if ConnectRetry is TRUE
+func (o *ClientOptions) SetConnectRetryInterval(t time.Duration) *ClientOptions {
+	o.ConnectRetryInterval = t
+	return o
+}
+
+// SetConnectRetry sets whether the connect function will automatically retry the connection
+// in the event of a failure (when true the token returned by the Connect function will
+// not complete until the connection is up or it is cancelled)
+// If ConnectRetry is true then subscriptions should be requested in OnConnect handler
+// Setting this to TRUE permits mesages to be published before the connection is established
+func (o *ClientOptions) SetConnectRetry(a bool) *ClientOptions {
+	o.ConnectRetry = a
+	return o
+}
+
+// SetMessageChannelDepth DEPRECATED The value set here no longer has any effect, this function
+// remains so the API is not altered.
 func (o *ClientOptions) SetMessageChannelDepth(s uint) *ClientOptions {
 	o.MessageChannelDepth = s
 	return o

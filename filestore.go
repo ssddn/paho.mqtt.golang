@@ -124,7 +124,7 @@ func (store *FileStore) Get(key string) packets.ControlPacket {
 }
 
 // All will provide a list of all of the keys associated with messages
-// currenly residing in the FileStore.
+// currently residing in the FileStore.
 func (store *FileStore) All() []string {
 	store.RLock()
 	defer store.RUnlock()
@@ -166,7 +166,7 @@ func (store *FileStore) all() []string {
 	for _, f := range files {
 		DEBUG.Println(STR, "file in All():", f.Name())
 		name := f.Name()
-		if name[len(name)-4:len(name)] != msgExt {
+		if name[len(name)-4:] != msgExt {
 			DEBUG.Println(STR, "skipping file, doesn't have right extension: ", name)
 			continue
 		}
